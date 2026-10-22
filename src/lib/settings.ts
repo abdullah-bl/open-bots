@@ -6,6 +6,8 @@ export type CloudKind = 'anthropic' | 'openai-compat'
 export interface Settings {
   /** Private mode: every bot runs on-device and nothing leaves this computer. */
   privacy: boolean
+  /** Internet for the Linux computer and the shell, through the WISP relay. */
+  internet: boolean
   localModel: string
   autoLoadLocal: boolean
   cloud: CloudKind
@@ -15,10 +17,13 @@ export interface Settings {
   compatBaseURL: string
   compatKey: string
   compatModel: string
+  /** Send calls through open-bot's server; unset means the provider's default (see presets). */
+  compatViaServer?: boolean
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   privacy: false,
+  internet: true,
   // Each backend falls back to its own default when this id belongs to the other one.
   localModel: 'Qwen3.5-2B-q4f16_1-MLC',
   autoLoadLocal: false,
@@ -58,4 +63,10 @@ export function useSettings() {
 export function cloudConfigured(s: Settings) {
   if (s.cloud === 'anthropic') return !!s.anthropicKey
   return !!s.compatBaseURL && !!s.compatModel
+}
+
+/** The WISP relay on this site, as ws(s)://host/wisp/; `offline` refuses every connection. */
+export function wispUrl(offline = false) {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${scheme}://${location.host}/wisp/${offline ? '?offline' : ''}`
 }

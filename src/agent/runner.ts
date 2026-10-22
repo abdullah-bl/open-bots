@@ -1,6 +1,7 @@
 import type { AgentModel } from './models'
 import type { Bot, ServerStep, Thread, ToolCall, ToolContext, ToolDef, ToolResult, Turn } from './types'
-import { CLIENT_WEB_TOOLS, TOOLS, TOOL_BY_NAME, ruleFor, validateInput } from './tools'
+import { CLIENT_WEB_TOOLS, COMPUTER_TOOL, COMPUTER_TOOLS, TOOLS, TOOL_BY_NAME, ruleFor, validateInput } from './tools'
+import { runComputerAction } from '../computer/actions'
 import { Workspace } from './workspace'
 
 const MAX_STEPS = 30
@@ -20,10 +21,14 @@ function id() {
   return crypto.randomUUID()
 }
 
-/** The tools a model is offered. Fixed per model so the request prefix never changes. */
-export function toolsFor(model: AgentModel): ToolDef[] {
+/**
+ * The tools a model is offered. Fixed per model and bot so the request prefix
+ * never changes. Claude gets the computer as its own toolset instead (see models.ts).
+ */
+export function toolsFor(model: AgentModel, computer: boolean): ToolDef[] {
   if (!model.tools) return []
-  return model.serverWeb ? TOOLS.filter((t) => !CLIENT_WEB_TOOLS.has(t.name)) : TOOLS
+  const base = model.serverWeb ? TOOLS.filter((t) => !CLIENT_WEB_TOOLS.has(t.name)) : TOOLS
+  return computer && !model.nativeComputer ? [...base, ...COMPUTER_TOOLS] : base
 }
 
 /**
@@ -47,7 +52,8 @@ export async function runAgent(
     await hooks.save(t)
   }
 
-  const tools = toolsFor(model)
+  const computer = !!t.computer && model.tools
+  const tools = toolsFor(model, computer)
   const workspace = new Workspace(t.botId)
 
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -72,6 +78,7 @@ export async function runAgent(
         system: t.system,
         turns: t.turns,
         tools,
+        computer,
         signal,
         onText: (d) => {
           live.text += d
@@ -116,12 +123,21 @@ export async function runAgent(
     // All results go back in one turn, but each is shown as soon as its tool finishes.
     const resultsId = id()
     const results: ToolResult[] = []
+    let computerFailed = false
     for (const call of result.toolCalls) {
+      const toolset = call.toolset
       if (signal.aborted) {
-        results.push({ callId: call.id, name: call.name, output: 'Stopped by the user before this ran.', isError: true })
+        results.push({ callId: call.id, name: call.name, output: 'Stopped by the user before this ran.', isError: true, toolset })
         continue
       }
-      results.push(await runTool(call, workspace, signal, hooks))
+      // Claude's batched computer actions: once one fails, the rest don't run.
+      if (toolset === 'computer' && computerFailed) {
+        results.push({ callId: call.id, name: call.name, output: 'Not executed: an earlier computer action in this turn failed.', isError: true, toolset })
+        continue
+      }
+      const r = toolset === 'computer' ? await runComputerCall(call, signal, hooks) : await runTool(call, workspace, signal, hooks)
+      if (toolset === 'computer' && r.isError) computerFailed = true
+      results.push(r)
       hooks.onThread({ ...t, turns: [...t.turns, { kind: 'tool_results', id: resultsId, at: Date.now(), results: [...results] }] })
     }
     await append({ kind: 'tool_results', id: resultsId, at: Date.now(), results })
@@ -139,6 +155,30 @@ export async function runAgent(
     stop: 'done',
   })
   return t
+}
+
+/** One member of Claude's computer toolset. Results must echo the toolset name. */
+async function runComputerCall(call: ToolCall, signal: AbortSignal, hooks: RunHooks): Promise<ToolResult> {
+  const base = { callId: call.id, name: call.name, toolset: 'computer' as const }
+  const rule = ruleFor(hooks.getBot().rules, COMPUTER_TOOL)
+  if (rule === 'block') return { ...base, output: 'The user has blocked computer use for this bot.', isError: true, decision: 'blocked' }
+  let decision: ToolResult['decision'] = 'auto'
+  if (rule === 'ask') {
+    hooks.onStatus('Waiting for approval: Use the computer')
+    const answer = await hooks.approve(call, COMPUTER_TOOL)
+    if (answer === 'deny') return { ...base, output: 'The user declined this action.', isError: true, decision: 'denied' }
+    if (answer === 'always') await hooks.updateBot((b) => ({ ...b, rules: { ...b.rules, computer: 'allow' } }))
+    decision = 'approved'
+  }
+  if (signal.aborted) return { ...base, output: 'Stopped by the user before this ran.', isError: true }
+  hooks.onStatus('Using the computer')
+  const started = Date.now()
+  try {
+    const out = await runComputerAction(call.name, call.input)
+    return { ...base, output: out.output, isError: !!out.isError, image: out.image, decision, ms: Date.now() - started }
+  } catch (err) {
+    return { ...base, output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true, decision, ms: Date.now() - started }
+  }
 }
 
 async function runTool(call: ToolCall, workspace: Workspace, signal: AbortSignal, hooks: RunHooks): Promise<ToolResult> {
@@ -169,19 +209,26 @@ async function runTool(call: ToolCall, workspace: Workspace, signal: AbortSignal
   }
 
   hooks.onStatus(tool.label)
-  const ctx: ToolContext = { bot: hooks.getBot(), workspace, signal, updateBot: hooks.updateBot }
+  const ctx: ToolContext = {
+    bot: hooks.getBot(),
+    workspace,
+    signal,
+    updateBot: hooks.updateBot,
+    progress: (msg) => hooks.onStatus(`${tool.label}: ${msg}`),
+  }
+  const started = Date.now()
   try {
     const out = await tool.run(call.input, ctx)
-    return { ...base, output: out.output, isError: !!out.isError, decision }
+    return { ...base, output: out.output, isError: !!out.isError, decision, files: out.files, image: out.image, ms: Date.now() - started }
   } catch (err) {
-    return { ...base, output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true, decision }
+    return { ...base, output: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true, decision, ms: Date.now() - started }
   }
 }
 
 export function describeError(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err)
-  if (/Failed to fetch|NetworkError|CORS/i.test(msg)) {
-    return `Could not reach the model provider (${msg}). It may block browser requests; a small proxy fixes that.`
+  if (/Failed to fetch|NetworkError|CORS|Connection error/i.test(msg)) {
+    return `Could not reach the model provider (${msg}). If it blocks requests from browsers, turn on "Send requests through open-bot's server" in Settings.`
   }
   if (/\b401\b|invalid.*key|authentication/i.test(msg)) return `The API key was rejected: ${msg}`
   return msg

@@ -6,6 +6,8 @@ import { buildSystemPrompt } from './prompt'
 import { computeNextRun } from './scheduler'
 import { deleteBotData, loadBots, loadThreads, saveBot, saveThread } from './store'
 import { Workspace } from './workspace'
+import { closeShell, setShellInternet } from './sandbox/shell'
+import { computer } from '../computer/vm'
 import { botFromTemplate, type BotTemplate } from './templates'
 
 export interface AgentState {
@@ -50,6 +52,8 @@ class AgentManager {
 
   setSettings(s: Settings) {
     this.settings = s
+    setShellInternet(s.internet)
+    computer().setInternet(s.internet)
   }
 
   async init() {
@@ -67,7 +71,15 @@ class AgentManager {
 
   private freshThread(bot: Bot): Thread {
     const now = Date.now()
-    return { id: crypto.randomUUID(), botId: bot.id, system: buildSystemPrompt(bot, true), turns: [], createdAt: now, updatedAt: now }
+    return {
+      id: crypto.randomUUID(),
+      botId: bot.id,
+      system: buildSystemPrompt(bot, true),
+      computer: !!bot.computer,
+      turns: [],
+      createdAt: now,
+      updatedAt: now,
+    }
   }
 
   bot(id: string) {
@@ -98,6 +110,7 @@ class AgentManager {
     this.stop(botId)
     await deleteBotData(botId)
     await new Workspace(botId).destroy()
+    await closeShell(botId)
     const { [botId]: _t, ...threads } = this.state.threads
     const { [botId]: _s, ...status } = this.state.status
     this.set({ bots: this.state.bots.filter((b) => b.id !== botId), threads, status })
@@ -171,11 +184,23 @@ class AgentManager {
         getBot: () => this.bot(botId)!,
         updateBot: (fn) => this.updateBot(botId, fn),
       })
+      // Keep what the bot did on the computer (installed software, open apps) across reloads.
+      if (final.computer && final.turns.slice(thread.turns.length).some((t) => t.kind === 'tool_results' && t.results.some((r) => r.toolset === 'computer' || r.name.startsWith('computer_')))) {
+        const vm = computer()
+        if (vm.status.state === 'ready') await vm.saveSnapshot().catch(() => {})
+      }
       const last = final.turns[final.turns.length - 1]
       if (source === 'schedule' && last?.kind === 'assistant' && document.hidden) {
         notify(bot, 'Scheduled run finished', last.text.slice(0, 180) || 'Done.')
       }
-      this.setStatus(botId, { state: 'idle' })
+      const succeeded = last?.kind === 'assistant' && last.stop !== 'error' && last.stop !== 'stopped'
+      this.setStatus(botId, { state: 'idle', done: succeeded })
+      if (succeeded) {
+        setTimeout(() => {
+          const s = this.state.status[botId]
+          if (s?.state === 'idle' && s.done) this.setStatus(botId, { state: 'idle' })
+        }, 2600)
+      }
     } catch (err) {
       this.setStatus(botId, { state: 'error', message: err instanceof Error ? err.message : String(err) })
     } finally {

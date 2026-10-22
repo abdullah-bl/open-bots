@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { Settings } from '../lib/settings'
-import { CLAUDE_MODELS, OPENAI_COMPAT_PRESETS, type OpenAICompatPresetId } from '../lib/providers/openaiCompat'
+import { CLAUDE_MODELS, OPENAI_COMPAT_PRESETS, usesServer, type OpenAICompatPresetId } from '../lib/providers/openaiCompat'
 import { localEngine } from '../lib/providers/local'
 import { useLocalStatus } from '../hooks/useLocalStatus'
 
@@ -92,6 +92,20 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
       </section>
 
       <section>
+        <h3>Internet for the computer and shell</h3>
+        <label className="check">
+          <input type="checkbox" checked={s.internet} onChange={(e) => update({ internet: e.target.checked })} />
+          <span>
+            Let the Linux computer and the shell reach the internet
+            <span className="hint">
+              Traffic goes through open-bot's relay on this site, to public addresses only: your local network, this machine and cloud metadata
+              addresses are blocked. DNS lookups go to Cloudflare over HTTPS. The computer picks up a change when it next starts.
+            </span>
+          </span>
+        </label>
+      </section>
+
+      <section>
         <h3>Cloud model</h3>
         <p className="hint">Bots run their agent loop on this model. Claude searches and reads the web on its own servers; other providers use open-bot's web proxy.</p>
         <div className="seg">
@@ -136,7 +150,7 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
                 value={s.compatPreset}
                 onChange={(e) => {
                   const p = OPENAI_COMPAT_PRESETS.find((x) => x.id === e.target.value)!
-                  update({ compatPreset: p.id as OpenAICompatPresetId, compatBaseURL: p.baseURL, compatModel: p.model })
+                  update({ compatPreset: p.id as OpenAICompatPresetId, compatBaseURL: p.baseURL, compatModel: p.model, compatViaServer: undefined })
                 }}
               >
                 {OPENAI_COMPAT_PRESETS.map((p) => (
@@ -165,6 +179,19 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
                 onChange={(e) => update({ compatKey: e.target.value.trim() })}
               />
             </label>
+            {!/^http:|^https?:\/\/(localhost|127\.)/i.test(s.compatBaseURL) && (
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={usesServer(s.compatPreset, s.compatBaseURL, s.compatViaServer)}
+                  onChange={(e) => update({ compatViaServer: e.target.checked })}
+                />
+                <span>
+                  Send requests through open-bot's server
+                  <span className="hint">Needed for providers that block browser requests, such as NVIDIA. Your key passes through this site's server to the provider.</span>
+                </span>
+              </label>
+            )}
             {s.compatPreset === 'ollama' && (
               <p className="hint">Start Ollama with OLLAMA_ORIGINS set to this site's address so the browser may call it.</p>
             )}

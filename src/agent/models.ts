@@ -3,12 +3,14 @@ import OpenAI from 'openai'
 import type { ServerStep, ToolCall, ToolDef, Turn } from './types'
 import { ThinkTagSplitter, localEngine } from '../lib/providers/local'
 import { cloudConfigured, type Settings } from '../lib/settings'
-import { OPENAI_COMPAT_PRESETS } from '../lib/providers/openaiCompat'
+import { OPENAI_COMPAT_PRESETS, usesServer } from '../lib/providers/openaiCompat'
 
 export interface StepRequest {
   system: string
   turns: Turn[]
   tools: ToolDef[]
+  /** Give the model the shared Linux computer. */
+  computer: boolean
   signal: AbortSignal
   onText: (delta: string) => void
   onThinking: (delta: string) => void
@@ -35,6 +37,8 @@ export interface AgentModel {
   serverWeb: boolean
   /** Whether this engine can call tools at all. */
   tools: boolean
+  /** Claude drives the computer with its own toolset rather than our computer_* tools. */
+  nativeComputer: boolean
   step(req: StepRequest): Promise<StepResult>
 }
 
@@ -50,7 +54,15 @@ export function pickModel(engine: 'auto' | 'cloud' | 'local', s: Settings): Agen
   if (!cloudConfigured(s)) return 'Add a cloud provider in Settings (or switch this bot to on-device).'
   if (s.cloud === 'anthropic') return claudeModel(s.anthropicKey, s.anthropicModel)
   const preset = OPENAI_COMPAT_PRESETS.find((p) => p.id === s.compatPreset)
-  const client = new OpenAI({ baseURL: s.compatBaseURL, apiKey: s.compatKey || 'not-needed', dangerouslyAllowBrowser: true })
+  // Providers without CORS (NVIDIA, many self-hosted gateways) are reached through
+  // our server's /api/llm passthrough; the real base URL rides along in a header.
+  const viaServer = usesServer(s.compatPreset, s.compatBaseURL, s.compatViaServer)
+  const client = new OpenAI({
+    baseURL: viaServer ? `${location.origin}/api/llm` : s.compatBaseURL,
+    apiKey: s.compatKey || 'not-needed',
+    dangerouslyAllowBrowser: true,
+    ...(viaServer ? { defaultHeaders: { 'x-openbot-target': s.compatBaseURL } } : {}),
+  })
   return openAIStyleModel(preset?.label ?? 'OpenAI-compatible', s.compatModel, s.compatPreset === 'ollama', (params, signal) =>
     client.chat.completions.create({ ...params, stream: true } as OpenAI.ChatCompletionCreateParamsStreaming, { signal }),
   )
@@ -68,6 +80,7 @@ function claudeModel(apiKey: string, model: string): AgentModel {
     local: false,
     serverWeb: true,
     tools: true,
+    nativeComputer: true,
     async step(req) {
       // Same tool list on every request: changing it would invalidate earlier reasoning blocks.
       const tools: Anthropic.Beta.BetaToolUnion[] = [
@@ -79,6 +92,7 @@ function claudeModel(apiKey: string, model: string): AgentModel {
         })),
         { type: 'web_search_20260209' as const, name: 'web_search' as const },
         { type: 'web_fetch_20260209' as const, name: 'web_fetch' as const },
+        ...(req.computer ? [{ type: 'computer_toolset_20260801' as const }] : []),
       ]
       const params: Anthropic.Beta.MessageCreateParamsStreaming = {
         model,
@@ -133,7 +147,10 @@ function fromClaudeMessage(msg: Anthropic.Beta.BetaMessage): StepResult {
   for (const b of msg.content) {
     if (b.type === 'text') text += b.text
     else if (b.type === 'thinking') thinking += b.thinking
-    else if (b.type === 'tool_use') toolCalls.push({ id: b.id, name: b.name, input: (b.input ?? {}) as Record<string, unknown> })
+    else if (b.type === 'tool_use') {
+      const toolset = (b as { toolset_name?: string }).toolset_name === 'computer' ? ('computer' as const) : undefined
+      toolCalls.push({ id: b.id, name: b.name, input: (b.input ?? {}) as Record<string, unknown>, ...(toolset ? { toolset } : {}) })
+    }
     else if (b.type === 'server_tool_use') serverSteps.push({ id: b.id, name: b.name, input: (b.input ?? {}) as Record<string, unknown> })
     else if (b.type === 'web_search_tool_result') {
       const step = serverSteps.find((s) => s.id === b.tool_use_id)
@@ -154,6 +171,7 @@ function fromClaudeMessage(msg: Anthropic.Beta.BetaMessage): StepResult {
 
 /** Deterministic: the same turns always produce the same messages, so the prefix never shifts. */
 function toClaudeMessages(turns: Turn[]): Anthropic.Beta.BetaMessageParam[] {
+  const keep = imagesToSend(turns)
   const out: Anthropic.Beta.BetaMessageParam[] = []
   const push = (role: 'user' | 'assistant', content: Anthropic.Beta.BetaContentBlockParam[]) => {
     if (!content.length) return
@@ -166,7 +184,18 @@ function toClaudeMessages(turns: Turn[]): Anthropic.Beta.BetaMessageParam[] {
     else if (t.kind === 'tool_results') {
       push(
         'user',
-        t.results.map((r) => ({ type: 'tool_result' as const, tool_use_id: r.callId, content: r.output || '(empty)', is_error: r.isError })),
+        t.results.map((r) => ({
+          type: 'tool_result' as const,
+          tool_use_id: r.callId,
+          is_error: r.isError,
+          ...(r.toolset ? { toolset_name: r.toolset } : {}),
+          content:
+            r.image && keep.has(r.callId)
+              ? [{ type: 'image' as const, source: { type: 'base64' as const, media_type: r.image.mediaType, data: r.image.data } }]
+              : r.image
+                ? '[Older screenshot removed to save space]'
+                : r.output || '(empty)',
+        })),
       )
     } else if (t.raw && t.provider === 'Claude') {
       push('assistant', t.raw as Anthropic.Beta.BetaContentBlockParam[])
@@ -203,6 +232,7 @@ function openAIStyleModel(provider: string, model: string, local: boolean, strea
     local,
     serverWeb: false,
     tools,
+    nativeComputer: false,
     async step(req) {
       const params = {
         model,
@@ -267,11 +297,23 @@ function openAIStyleModel(provider: string, model: string, local: boolean, strea
 }
 
 function toOpenAIMessages(turns: Turn[]): unknown[] {
+  const keep = imagesToSend(turns)
   const out: unknown[] = []
   for (const t of turns) {
     if (t.kind === 'user') out.push({ role: 'user', content: userText(t) })
     else if (t.kind === 'tool_results') {
       for (const r of t.results) out.push({ role: 'tool', tool_call_id: r.callId, content: r.output || '(empty)' })
+      // Tool messages carry text only, so screenshots follow as a user message.
+      const images = t.results.filter((r) => r.image && keep.has(r.callId))
+      if (images.length) {
+        out.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `Screenshot${images.length > 1 ? 's' : ''} from the computer:` },
+            ...images.map((r) => ({ type: 'image_url', image_url: { url: `data:${r.image!.mediaType};base64,${r.image!.data}` } })),
+          ],
+        })
+      }
     } else {
       // Claude's server-side web steps have no OpenAI equivalent; keep the visible text.
       if (!t.text.trim() && !t.toolCalls.length) continue
@@ -291,6 +333,18 @@ function toOpenAIMessages(turns: Turn[]): unknown[] {
     }
   }
   return out
+}
+
+/**
+ * Which screenshots go back to the model. Past 40, the oldest are dropped in
+ * blocks of 30 (keeping at least 10), so the history only changes now and then
+ * instead of on every request, which keeps the prompt cache useful.
+ */
+function imagesToSend(turns: Turn[]): Set<string> {
+  const ids: string[] = []
+  for (const t of turns) if (t.kind === 'tool_results') for (const r of t.results) if (r.image) ids.push(r.callId)
+  const drop = ids.length > 40 ? Math.floor((ids.length - 10) / 30) * 30 : 0
+  return new Set(ids.slice(drop))
 }
 
 function userText(t: Extract<Turn, { kind: 'user' }>) {

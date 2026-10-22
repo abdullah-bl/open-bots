@@ -1,7 +1,9 @@
 import type { JsonSchema, Rule, Schedule, ToolDef, ToolRisk } from './types'
 import { cleanPath, formatBytes, isTextFile } from './workspace'
-import { runJavaScript, runPython } from './sandbox/sandbox'
+import { runPython } from './sandbox/sandbox'
+import { runShell } from './sandbox/shell'
 import { computeNextRun } from './scheduler'
+import { runComputerAction } from '../computer/actions'
 
 const MAX_READ = 40_000
 
@@ -10,6 +12,17 @@ function schema(properties: JsonSchema['properties'], required: string[] = Objec
 }
 
 const str = (description: string) => ({ type: 'string' as const, description })
+
+/** Wasmer registry packages a bot can add to its shell. */
+const SHELL_PACKAGES: Record<string, { pkg: string; about: string }> = {
+  python: { pkg: 'python/python', about: 'python3 3.13, standard library only' },
+  sqlite: { pkg: 'sqlite/sqlite', about: 'sqlite3' },
+  node: { pkg: 'wasmer/edgejs', about: 'node, Node.js 24 compatible' },
+  quickjs: { pkg: 'wasmer/quickjs', about: 'qjs, small JavaScript engine' },
+  ripgrep: { pkg: 'wasmer/ripgrep', about: 'rg, fast search' },
+  php: { pkg: 'php/php', about: 'php 8.3' },
+  curl: { pkg: 'curl/curl', about: 'curl, HTTP(S) from the shell' },
+}
 
 export const TOOLS: ToolDef[] = [
   {
@@ -47,7 +60,7 @@ export const TOOLS: ToolDef[] = [
       const path = cleanPath(String(input.path))
       const content = String(input.content)
       await workspace.write(path, content)
-      return { output: `Wrote ${path} (${formatBytes(new TextEncoder().encode(content).length)}).` }
+      return { output: `Wrote ${path} (${formatBytes(new TextEncoder().encode(content).length)}).`, files: [path] }
     },
   },
   {
@@ -73,20 +86,40 @@ export const TOOLS: ToolDef[] = [
     schema: schema({ code: str('Python source to run') }),
     async run(input, { workspace, signal }) {
       const r = await runPython(String(input.code), workspace, signal)
-      return { output: r.output, isError: !r.ok }
+      return { output: r.output, isError: !r.ok, files: r.changedFiles }
     },
   },
   {
-    name: 'run_javascript',
-    label: 'Run JavaScript',
+    name: 'bash',
+    label: 'Run shell',
     risk: 'execute',
     description:
-      'Run JavaScript in an isolated web worker (no DOM, 30s limit). The code is the body of an async function with `files` ' +
-      '(an object of workspace path -> text) and `writeFile(path, text)` in scope. Use console.log or `return` a value.',
-    schema: schema({ code: str('JavaScript function body to run') }),
-    async run(input, { workspace, signal }) {
-      const r = await runJavaScript(String(input.code), workspace, signal)
-      return { output: r.output, isError: !r.ok }
+      'Run a bash command in a Unix shell compiled to WebAssembly (WASIX), sandboxed in the browser. It can reach public internet hosts when the user has internet access on (add the curl package for HTTP). ' +
+      'The working directory /workspace is your workspace, so files you create there are saved. Built in: bash, coreutils (ls, cat, head, sort, wc, cut, tr, …), grep, sed. There is no awk. ' +
+      'Add tools with `packages` (comma-separated, installed once per session): ' +
+      Object.entries(SHELL_PACKAGES)
+        .map(([k, v]) => `${k} (${v.about})`)
+        .join(', ') +
+      '. Use run_python instead for numpy, pandas or matplotlib.',
+    schema: schema(
+      {
+        command: str('The bash command or script to run'),
+        packages: str(`Optional extra tools, comma-separated: ${Object.keys(SHELL_PACKAGES).join(', ')}`),
+      },
+      ['command'],
+    ),
+    async run(input, { workspace, signal, progress }) {
+      const wanted = typeof input.packages === 'string' ? input.packages.split(',').map((p) => p.trim().toLowerCase()).filter(Boolean) : []
+      const unknown = wanted.filter((p) => !(p in SHELL_PACKAGES))
+      if (unknown.length) {
+        return { output: `Unknown package(s): ${unknown.join(', ')}. Available: ${Object.keys(SHELL_PACKAGES).join(', ')}.`, isError: true }
+      }
+      const r = await runShell(String(input.command), workspace, {
+        packages: wanted.map((p) => SHELL_PACKAGES[p].pkg),
+        signal,
+        onProgress: progress,
+      })
+      return { output: r.output, isError: !r.ok, files: r.changedFiles.filter((f) => !f.endsWith(' (deleted)')) }
     },
   },
   {
@@ -215,7 +248,144 @@ export const TOOLS: ToolDef[] = [
   },
 ]
 
-export const TOOL_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]))
+/**
+ * Rules and approvals treat every computer action as this one tool. Claude
+ * drives the computer through its own toolset; the tools below are for other models.
+ */
+export const COMPUTER_TOOL: ToolDef = {
+  name: 'computer',
+  label: 'Use the computer',
+  risk: 'computer',
+  description: 'Screenshots, mouse and keyboard on the shared Linux computer.',
+  schema: schema({}),
+  run: async () => ({ output: '' }),
+}
+
+const xy = (what: string) => ({
+  x: { type: 'integer' as const, description: `X pixel of ${what}, in screenshot coordinates` },
+  y: { type: 'integer' as const, description: `Y pixel of ${what}, in screenshot coordinates` },
+})
+
+/** Runs an action, then returns a fresh screenshot so the model sees the result. */
+async function actThenLook(member: string, input: Record<string, unknown>) {
+  const done = await runComputerAction(member, input)
+  if (done.isError || done.image) return done
+  await new Promise((r) => setTimeout(r, 300))
+  const shot = await runComputerAction('screenshot', {})
+  return { output: `${done.output}. Screenshot after the action attached.`, image: shot.image }
+}
+
+export const COMPUTER_TOOLS: ToolDef[] = [
+  {
+    name: 'computer_screenshot',
+    label: 'Take a screenshot',
+    risk: 'computer',
+    description: 'See the computer screen (a 1024x768 Linux desktop). Always look before you click.',
+    schema: schema({}),
+    run: () => runComputerAction('screenshot', {}),
+  },
+  {
+    name: 'computer_click',
+    label: 'Click',
+    risk: 'computer',
+    description: 'Click at a screen position.',
+    schema: schema(
+      {
+        ...xy('the click'),
+        button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Default left' },
+        clicks: { type: 'integer', description: '1 (default), 2 for double-click, 3 for triple-click' },
+        modifiers: str('Keys to hold, e.g. "ctrl" or "shift"'),
+      },
+      ['x', 'y'],
+    ),
+    run: (i) => {
+      const clicks = Number(i.clicks ?? 1)
+      const button = String(i.button ?? 'left')
+      const member = button === 'right' ? 'right_click' : button === 'middle' ? 'middle_click' : clicks >= 3 ? 'triple_click' : clicks === 2 ? 'double_click' : 'left_click'
+      return actThenLook(member, { coordinate: [i.x, i.y], ...(i.modifiers ? { text: i.modifiers } : {}) })
+    },
+  },
+  {
+    name: 'computer_type',
+    label: 'Type',
+    risk: 'computer',
+    description: 'Type text where the keyboard focus is (US layout). Use computer_key for Enter and shortcuts.',
+    schema: schema({ text: str('Text to type') }),
+    run: (i) => actThenLook('type', { text: i.text }),
+  },
+  {
+    name: 'computer_key',
+    label: 'Press keys',
+    risk: 'computer',
+    description: 'Press a key or combination, e.g. "Return", "ctrl+c", "alt+Tab", "Page_Down".',
+    schema: schema({ keys: str('Key or + combination'), repeat: { type: 'integer', description: 'Times to press, default 1' } }, ['keys']),
+    run: (i) => actThenLook('key', { text: i.keys, repeat: i.repeat ?? 1 }),
+  },
+  {
+    name: 'computer_scroll',
+    label: 'Scroll',
+    risk: 'computer',
+    description: 'Scroll the mouse wheel, optionally after moving to a position.',
+    schema: schema(
+      {
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+        amount: { type: 'integer', description: 'Wheel clicks, default 3' },
+        ...xy('where to scroll'),
+      },
+      ['direction'],
+    ),
+    run: (i) =>
+      actThenLook('scroll', {
+        scroll_direction: i.direction,
+        scroll_amount: i.amount ?? 3,
+        ...(i.x !== undefined && i.y !== undefined ? { coordinate: [i.x, i.y] } : {}),
+      }),
+  },
+  {
+    name: 'computer_drag',
+    label: 'Drag',
+    risk: 'computer',
+    description: 'Press at one position, drag, and release at another.',
+    schema: schema({
+      from_x: { type: 'integer' },
+      from_y: { type: 'integer' },
+      to_x: { type: 'integer' },
+      to_y: { type: 'integer' },
+    }),
+    run: (i) => actThenLook('left_click_drag', { start_coordinate: [i.from_x, i.from_y], coordinate: [i.to_x, i.to_y] }),
+  },
+  {
+    name: 'computer_move',
+    label: 'Move pointer',
+    risk: 'computer',
+    description: 'Move the mouse pointer without clicking (to hover).',
+    schema: schema(xy('the pointer')),
+    run: (i) => actThenLook('mouse_move', { coordinate: [i.x, i.y] }),
+  },
+  {
+    name: 'computer_zoom',
+    label: 'Zoom',
+    risk: 'computer',
+    description: 'See a region of the screen enlarged, to read small text. Coordinates stay in full-screenshot space.',
+    schema: schema({
+      x0: { type: 'integer' },
+      y0: { type: 'integer' },
+      x1: { type: 'integer' },
+      y1: { type: 'integer' },
+    }),
+    run: (i) => runComputerAction('zoom', { region: [i.x0, i.y0, i.x1, i.y1] }),
+  },
+  {
+    name: 'computer_wait',
+    label: 'Wait',
+    risk: 'computer',
+    description: 'Wait for something to load, then get a screenshot.',
+    schema: schema({ seconds: { type: 'integer', description: '1 to 30' } }),
+    run: (i) => runComputerAction('wait', { duration: Math.min(30, Number(i.seconds)) }),
+  },
+]
+
+export const TOOL_BY_NAME = new Map([...TOOLS, ...COMPUTER_TOOLS, COMPUTER_TOOL].map((t) => [t.name, t]))
 
 /** Tools that Claude replaces with its own server-side web search and fetch. */
 export const CLIENT_WEB_TOOLS = new Set(['web_search', 'fetch_url'])
@@ -226,17 +396,18 @@ export const DEFAULT_RULES: Record<ToolRisk, Rule> = {
   execute: 'allow',
   network: 'allow',
   notify: 'allow',
+  computer: 'allow',
 }
 
 /** Stricter defaults for the few tools that can lose work or act on their own. */
 const TOOL_DEFAULTS: Record<string, Rule> = {
   delete_file: 'ask',
-  run_javascript: 'ask',
   schedule_task: 'ask',
 }
 
 export function ruleFor(rules: Record<string, Rule>, tool: ToolDef): Rule {
-  return rules[tool.name] ?? TOOL_DEFAULTS[tool.name] ?? DEFAULT_RULES[tool.risk]
+  const name = tool.risk === 'computer' ? COMPUTER_TOOL.name : tool.name
+  return rules[name] ?? TOOL_DEFAULTS[name] ?? DEFAULT_RULES[tool.risk]
 }
 
 /** Checks a parsed tool input against its schema. Returns a problem, or null when valid. */
