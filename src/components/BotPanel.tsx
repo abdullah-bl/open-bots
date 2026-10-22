@@ -1,22 +1,40 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Bot, Engine, Rule, Schedule } from '../agent/types'
 import { agents } from '../agent/manager'
-import { TOOLS, ruleFor } from '../agent/tools'
+import { COMPUTER_TOOL, TOOLS, ruleFor } from '../agent/tools'
+import { ComputerView } from './ComputerView'
 import { Workspace, formatBytes, isTextFile, type FileInfo } from '../agent/workspace'
 import { computeNextRun, describeSchedule } from '../agent/scheduler'
 import { BOT_COLORS } from '../agent/templates'
+import { AVATAR_EYES, AVATAR_SHAPES, AVATAR_TOPS, avatarFor, type AvatarStyle, type Mood } from '../agent/avatar'
+import { BotAvatar } from './BotAvatar'
 
-type Tab = 'setup' | 'files' | 'memory' | 'schedules' | 'rules'
+export type Tab = 'computer' | 'setup' | 'files' | 'memory' | 'schedules' | 'rules'
 
-export function BotPanel({ bot, busy, onClose, refreshKey }: { bot: Bot; busy: boolean; onClose: () => void; refreshKey: number }) {
-  const [tab, setTab] = useState<Tab>('files')
+/** Asks the panel to show a tab (and, for Files, a file). */
+export interface PanelRequest {
+  tab: Tab
+  path?: string
+  /** Changes on every request so repeating one still works. */
+  nonce: number
+}
+
+export function BotPanel({ bot, busy, onClose, refreshKey, request }: { bot: Bot; busy: boolean; onClose: () => void; refreshKey: number; request?: PanelRequest | null }) {
+  const [tab, setTab] = useState<Tab>(request?.tab ?? 'files')
+  const [seen, setSeen] = useState(request)
+  if (request !== seen) {
+    setSeen(request)
+    if (request) setTab(request.tab)
+  }
+  const tabs: Tab[] = bot.computer ? ['computer', 'files', 'memory', 'schedules', 'rules', 'setup'] : ['files', 'memory', 'schedules', 'rules', 'setup']
+  const focus = request?.path ? { path: request.path, nonce: request.nonce } : null
   const update = (fn: (b: Bot) => Bot) => agents.updateBot(bot.id, fn)
 
   return (
     <aside className="panel" aria-label={`${bot.name} details`}>
       <header>
         <div className="tabs" role="tablist">
-          {(['files', 'memory', 'schedules', 'rules', 'setup'] as Tab[]).map((t) => (
+          {tabs.map((t) => (
             <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>
               {t[0].toUpperCase() + t.slice(1)}
               {t === 'memory' && bot.memory.length > 0 && <span className="count">{bot.memory.length}</span>}
@@ -29,7 +47,8 @@ export function BotPanel({ bot, busy, onClose, refreshKey }: { bot: Bot; busy: b
         </button>
       </header>
       <div className="panel-body">
-        {tab === 'files' && <FilesTab botId={bot.id} refreshKey={refreshKey} />}
+        {tab === 'computer' && bot.computer && <ComputerView busyBot={busy ? bot.name : null} />}
+        {tab === 'files' && <FilesTab botId={bot.id} refreshKey={refreshKey} focus={focus} />}
         {tab === 'memory' && <MemoryTab bot={bot} update={update} />}
         {tab === 'schedules' && <SchedulesTab bot={bot} update={update} />}
         {tab === 'rules' && <RulesTab bot={bot} update={update} />}
@@ -39,7 +58,7 @@ export function BotPanel({ bot, busy, onClose, refreshKey }: { bot: Bot; busy: b
   )
 }
 
-function FilesTab({ botId, refreshKey }: { botId: string; refreshKey: number }) {
+function FilesTab({ botId, refreshKey, focus }: { botId: string; refreshKey: number; focus?: { path: string; nonce: number } | null }) {
   const ws = useRef(new Workspace(botId)).current
   const [files, setFiles] = useState<FileInfo[]>([])
   const [open, setOpen] = useState<{ path: string; text?: string; url?: string } | null>(null)
@@ -56,12 +75,32 @@ function FilesTab({ botId, refreshKey }: { botId: string; refreshKey: number }) 
     refresh()
   }
 
-  const view = async (path: string) => {
-    if (open?.url) URL.revokeObjectURL(open.url)
-    if (isTextFile(path)) setOpen({ path, text: await ws.readText(path) })
-    else if (/\.(png|jpe?g|gif|webp|svg)$/i.test(path)) setOpen({ path, url: URL.createObjectURL(await ws.readBlob(path)) })
-    else setOpen({ path, text: '(binary file; download it to open)' })
-  }
+  const view = useCallback(
+    async (path: string) => {
+      try {
+        if (/\.(png|jpe?g|gif|webp|svg)$/i.test(path)) {
+          const url = URL.createObjectURL(await ws.readBlob(path))
+          setOpen((prev) => {
+            if (prev?.url) URL.revokeObjectURL(prev.url)
+            return { path, url }
+          })
+        } else {
+          const text = isTextFile(path) ? await ws.readText(path) : '(binary file; download it to open)'
+          setOpen((prev) => {
+            if (prev?.url) URL.revokeObjectURL(prev.url)
+            return { path, text }
+          })
+        }
+      } catch {
+        setOpen({ path, text: '(this file no longer exists)' })
+      }
+    },
+    [ws],
+  )
+
+  useEffect(() => {
+    if (focus) view(focus.path)
+  }, [focus, view])
 
   const download = async (path: string) => {
     const url = URL.createObjectURL(await ws.readBlob(path))
@@ -248,7 +287,7 @@ function RulesTab({ bot, update }: { bot: Bot; update: (fn: (b: Bot) => Bot) => 
       <p className="hint">Choose what this bot may do on its own, what needs your OK, and what it may never do.</p>
       <table className="rules">
         <tbody>
-          {TOOLS.map((t) => {
+          {(bot.computer ? [...TOOLS, COMPUTER_TOOL] : TOOLS).map((t) => {
             const rule = ruleFor(bot.rules, t)
             return (
               <tr key={t.name}>
@@ -283,20 +322,7 @@ function SetupTab({ bot, update, busy }: { bot: Bot; update: (fn: (b: Bot) => Bo
         Name
         <input className="field" value={bot.name} onChange={(e) => update((b) => ({ ...b, name: e.target.value }))} />
       </label>
-      <div className="lbl">
-        Color
-        <div className="colors">
-          {BOT_COLORS.map((c) => (
-            <button
-              key={c}
-              className={`swatch ${bot.color === c ? 'on' : ''}`}
-              style={{ background: c }}
-              onClick={() => update((b) => ({ ...b, color: c }))}
-              aria-label={`Color ${c}`}
-            />
-          ))}
-        </div>
-      </div>
+      <AvatarBuilder bot={bot} update={update} />
       <label className="lbl">
         Goal
         <textarea className="field" rows={3} value={bot.goal} onChange={(e) => update((b) => ({ ...b, goal: e.target.value }))} placeholder="What should this bot work toward?" />
@@ -316,6 +342,16 @@ function SetupTab({ bot, update, busy }: { bot: Bot; update: (fn: (b: Bot) => Bo
         </div>
         <span className="hint">Auto uses your cloud model when one is set, otherwise the on-device model.</span>
       </div>
+      <label className="check">
+        <input type="checkbox" checked={!!bot.computer} onChange={(e) => update((b) => ({ ...b, computer: e.target.checked }))} />
+        <span>
+          <strong>Computer use</strong>
+          <span className="hint">
+            Let this bot see and drive the shared Linux desktop with screenshots, mouse and keyboard. It needs a model that understands images, such as
+            Claude.
+          </span>
+        </span>
+      </label>
       <p className="hint">Changes to the goal and instructions apply from the bot's next thread.</p>
       <div className="row">
         <button onClick={() => agents.newThread(bot.id)} disabled={busy}>
@@ -330,6 +366,70 @@ function SetupTab({ bot, update, busy }: { bot: Bot; update: (fn: (b: Bot) => Bo
             Delete bot…
           </button>
         )}
+      </div>
+    </div>
+  )
+}
+
+/** Pick the bot's color and face; the preview reacts when clicked. */
+function AvatarBuilder({ bot, update }: { bot: Bot; update: (fn: (b: Bot) => Bot) => void }) {
+  const look = avatarFor(bot)
+  const [mood, setMood] = useState<Mood>('idle')
+  const set = (patch: Partial<AvatarStyle>) => update((b) => ({ ...b, avatar: { ...avatarFor(b), ...patch } }))
+  const cheer = () => {
+    setMood('happy')
+    setTimeout(() => setMood('idle'), 1400)
+  }
+  const option = <K extends keyof AvatarStyle>(key: K, value: AvatarStyle[K]) => (
+    <button
+      key={value}
+      className={`pick ${look[key] === value ? 'on' : ''}`}
+      onClick={() => {
+        set({ [key]: value } as Partial<AvatarStyle>)
+        cheer()
+      }}
+      aria-label={`${key} ${value}`}
+      aria-pressed={look[key] === value}
+    >
+      <BotAvatar id={`${bot.id}-${key}-${value}`} color={bot.color} look={{ ...look, [key]: value }} size={34} />
+    </button>
+  )
+  return (
+    <div className="builder">
+      <button className="builder-stage icon" onClick={cheer} aria-label={`Say hi to ${bot.name}`}>
+        <BotAvatar id={bot.id} color={bot.color} look={look} mood={mood} size={96} />
+      </button>
+      <div className="builder-opts">
+        <div className="builder-row">
+          <span>Color</span>
+          <div className="colors">
+            {BOT_COLORS.map((c) => (
+              <button
+                key={c}
+                className={`swatch ${bot.color === c ? 'on' : ''}`}
+                style={{ background: c }}
+                onClick={() => {
+                  update((b) => ({ ...b, color: c }))
+                  cheer()
+                }}
+                aria-label={`Color ${c}`}
+                aria-pressed={bot.color === c}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="builder-row">
+          <span>Head</span>
+          {AVATAR_SHAPES.map((v) => option('shape', v))}
+        </div>
+        <div className="builder-row">
+          <span>Eyes</span>
+          {AVATAR_EYES.map((v) => option('eyes', v))}
+        </div>
+        <div className="builder-row">
+          <span>Top</span>
+          {AVATAR_TOPS.map((v) => option('top', v))}
+        </div>
       </div>
     </div>
   )

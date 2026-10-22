@@ -1,8 +1,31 @@
 import { useEffect, useState } from 'react'
 import type { Settings } from '../lib/settings'
-import { CLAUDE_MODELS, OPENAI_COMPAT_PRESETS, type OpenAICompatPresetId } from '../lib/providers/openaiCompat'
+import { CLAUDE_MODELS, OPENAI_COMPAT_PRESETS, usesServer, type OpenAICompatPresetId } from '../lib/providers/openaiCompat'
 import { localEngine } from '../lib/providers/local'
 import { useLocalStatus } from '../hooks/useLocalStatus'
+import { defaultServer, resolveServer } from '../lib/server'
+
+type Reach = 'checking' | 'ok' | 'down'
+
+/** Pings the server's health endpoint whenever its address changes. */
+function useServerReach(url: string | null) {
+  const [reach, setReach] = useState<{ url: string | null; state: Reach }>({ url, state: 'checking' })
+  if (reach.url !== url) setReach({ url, state: 'checking' })
+  useEffect(() => {
+    if (!url) return
+    const abort = new AbortController()
+    const timer = setTimeout(() => {
+      fetch(`${url}/api/health`, { signal: abort.signal })
+        .then((r) => setReach({ url, state: r.ok ? 'ok' : 'down' }))
+        .catch(() => !abort.signal.aborted && setReach({ url, state: 'down' }))
+    }, 400)
+    return () => {
+      clearTimeout(timer)
+      abort.abort()
+    }
+  }, [url])
+  return reach.state
+}
 
 export function SettingsPanel(props: { settings: Settings; update: (p: Partial<Settings>) => void; onClose: () => void }) {
   const { settings: s, update } = props
@@ -13,6 +36,8 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
   const gpu = status.state !== 'detecting' && status.backend === 'gpu'
   const models = detecting ? [] : localEngine.models()
   const selected = detecting ? null : localEngine.pick(s.localModel)
+  const server = resolveServer(s.serverURL)
+  const reach = useServerReach(server)
 
   useEffect(() => {
     if (status.state === 'detecting' || status.state === 'loading') return
@@ -92,6 +117,48 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
       </section>
 
       <section>
+        <h3>open-bot server</h3>
+        <p className="hint">
+          Web search and page reading (for models other than Claude), the provider passthrough, and internet for the computer and shell run on a
+          small server.{' '}
+          {defaultServer()
+            ? 'Leave this empty to use the one this site came with.'
+            : "This site is static and has no server of its own: add one's address to turn these on."}
+        </p>
+        <label className="lbl">
+          Server address
+          <input
+            className="field"
+            value={s.serverURL}
+            placeholder={defaultServer() ?? 'https://your-worker.example.workers.dev'}
+            onChange={(e) => update({ serverURL: e.target.value.trim() })}
+          />
+        </label>
+        {server ? (
+          <p className={`hint server-reach ${reach}`}>
+            {reach === 'checking' ? 'Checking…' : reach === 'ok' ? `Connected to ${new URL(server).host}` : `Can't reach ${server}`}
+          </p>
+        ) : (
+          <p className="hint">No server: bots can still use files, the shell, Python, memory, schedules and the computer, all offline.</p>
+        )}
+      </section>
+
+      <section>
+        <h3>Internet for the computer and shell</h3>
+        <label className="check">
+          <input type="checkbox" checked={s.internet && !!server} disabled={!server} onChange={(e) => update({ internet: e.target.checked })} />
+          <span>
+            Let the Linux computer and the shell reach the internet
+            <span className="hint">
+              {server ? '' : 'Needs an open-bot server with a relay. '}
+              Traffic goes through open-bot's relay, to public addresses only: your local network, this machine and cloud metadata
+              addresses are blocked. DNS lookups go to Cloudflare over HTTPS. The computer picks up a change when it next starts.
+            </span>
+          </span>
+        </label>
+      </section>
+
+      <section>
         <h3>Cloud model</h3>
         <p className="hint">Bots run their agent loop on this model. Claude searches and reads the web on its own servers; other providers use open-bot's web proxy.</p>
         <div className="seg">
@@ -136,7 +203,7 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
                 value={s.compatPreset}
                 onChange={(e) => {
                   const p = OPENAI_COMPAT_PRESETS.find((x) => x.id === e.target.value)!
-                  update({ compatPreset: p.id as OpenAICompatPresetId, compatBaseURL: p.baseURL, compatModel: p.model })
+                  update({ compatPreset: p.id as OpenAICompatPresetId, compatBaseURL: p.baseURL, compatModel: p.model, compatViaServer: undefined })
                 }}
               >
                 {OPENAI_COMPAT_PRESETS.map((p) => (
@@ -165,6 +232,20 @@ export function SettingsPanel(props: { settings: Settings; update: (p: Partial<S
                 onChange={(e) => update({ compatKey: e.target.value.trim() })}
               />
             </label>
+            {!/^http:|^https?:\/\/(localhost|127\.)/i.test(s.compatBaseURL) && (
+              <label className="check">
+                <input
+                  type="checkbox"
+                  disabled={!server}
+                  checked={!!server && usesServer(s.compatPreset, s.compatBaseURL, s.compatViaServer)}
+                  onChange={(e) => update({ compatViaServer: e.target.checked })}
+                />
+                <span>
+                  Send requests through open-bot's server
+                  <span className="hint">Needed for providers that block browser requests, such as NVIDIA. {server ? 'Your key passes through the server to the provider.' : 'Set up an open-bot server above first.'}</span>
+                </span>
+              </label>
+            )}
             {s.compatPreset === 'ollama' && (
               <p className="hint">Start Ollama with OLLAMA_ORIGINS set to this site's address so the browser may call it.</p>
             )}

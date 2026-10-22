@@ -1,0 +1,63 @@
+# Builds open-bot as a static site and publishes it to GitHub Pages.
+#
+# One-time setup in the repository's settings:
+#   - Pages → Build and deployment → Source: GitHub Actions
+#   - Optional: Secrets and variables → Actions → Variables → OPENBOT_SERVER_URL,
+#     the address of a hosted open-bot server (a Cloudflare Worker from
+#     server/worker.ts, or `npm run preview` on a machine of yours). Without it the
+#     site runs without web tools, the provider passthrough and internet for the
+#     computer; people can still set a server in the app's Settings.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # The Linux computer's BIOS and disk image (about 20 MB), downloaded once and cached.
+      - uses: actions/cache@v4
+        with:
+          path: public/vm
+          key: vm-${{ hashFiles('scripts/fetch-vm.mjs') }}
+      - run: npm run vm:fetch
+
+      - run: npm run build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/
+          VITE_STATIC_HOST: '1'
+          VITE_SERVER_URL: ${{ vars.OPENBOT_SERVER_URL }}
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

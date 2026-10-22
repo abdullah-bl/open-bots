@@ -1,56 +1,149 @@
 /**
  * The only server piece open-bot needs: browsers can't fetch arbitrary sites
- * (CORS) or hold search API keys, so agents reach the web through these two
+ * (CORS) or hold search API keys, so agents reach the web through these
  * endpoints. Plain Request -> Response, so it runs in the Vite dev server, a
  * Cloudflare Worker, Deno, or Bun unchanged.
  *
- *   GET /api/fetch?url=https://…   raw page body (the browser extracts the text)
- *   GET /api/search?q=…            { source, results: [{ title, url, snippet }] }
+ *   GET  /api/health                { ok: true }, so the app can tell the server is up
+ *   GET  /api/fetch?url=https://…   raw page body (the browser extracts the text)
+ *   GET  /api/search?q=…            { source, results: [{ title, url, snippet }] }
+ *   POST /api/llm/<path>            forwards an OpenAI-style API call to the base URL
+ *                                   in the x-openbot-target header, for providers
+ *                                   (like NVIDIA) that don't allow browser requests
  *
  * Search uses Brave (BRAVE_API_KEY) or SearXNG (SEARXNG_URL) when configured,
  * otherwise falls back to Wikipedia search, which needs no key.
+ *
+ * When the app is hosted elsewhere (GitHub Pages), it calls this server
+ * cross-origin; ALLOWED_ORIGINS limits which sites may do that.
  */
 
 export interface ProxyEnv {
   BRAVE_API_KEY?: string
   SEARXNG_URL?: string
+  /** Comma-separated origins allowed to call this server from other sites; "*" or unset allows any, "" none. */
+  ALLOWED_ORIGINS?: string
 }
 
 const MAX_BYTES = 3_000_000
 const UA = 'open-bot/0.1 (personal AI agent; https://github.com/open-bot)'
 
-export async function handleProxy(req: Request, env: ProxyEnv): Promise<Response | null> {
+export interface ProxyOptions {
+  /** Extra check on a hostname, e.g. resolving it and refusing private addresses (Node). */
+  isAllowedHost?: (host: string) => Promise<boolean>
+}
+
+export async function handleProxy(req: Request, env: ProxyEnv, opts: ProxyOptions = {}): Promise<Response | null> {
   const url = new URL(req.url)
-  if (url.pathname === '/api/fetch') return fetchPage(url.searchParams.get('url') ?? '')
+  if (!url.pathname.startsWith('/api/')) return null
+  const origin = req.headers.get('origin')
+  if (!originAllowed(origin, url.origin, env.ALLOWED_ORIGINS)) return json({ error: 'This site may not use this server' }, 403)
+  const cors = new Headers({ vary: 'origin' })
+  if (origin && new URL(origin).host !== url.host) {
+    cors.set('access-control-allow-origin', origin)
+    cors.set('access-control-expose-headers', 'x-final-url, x-request-id, retry-after')
+  }
+  if (req.method === 'OPTIONS') {
+    cors.set('access-control-allow-methods', 'GET, POST, OPTIONS')
+    cors.set('access-control-allow-headers', req.headers.get('access-control-request-headers') ?? '*')
+    cors.set('access-control-max-age', '86400')
+    return new Response(null, { status: 204, headers: cors })
+  }
+  const res = await route(req, url, env, opts)
+  cors.forEach((v, k) => res?.headers.set(k, v))
+  return res
+}
+
+/** Whether a page on `origin` may call the server at `self` (same site always may). */
+export function originAllowed(origin: string | null | undefined, self: string, allowed: string | undefined): boolean {
+  if (!origin) return true
+  try {
+    if (new URL(origin).host === new URL(self).host) return true
+  } catch {
+    return false
+  }
+  const list = (allowed ?? '*').split(',').map((o) => o.trim().replace(/\/+$/, ''))
+  return list.includes('*') || list.includes(origin)
+}
+
+async function route(req: Request, url: URL, env: ProxyEnv, opts: ProxyOptions): Promise<Response | null> {
+  if (url.pathname === '/api/health') return json({ ok: true })
+  if (url.pathname === '/api/fetch') return fetchPage(url.searchParams.get('url') ?? '', opts)
   if (url.pathname === '/api/search') return search(url.searchParams.get('q') ?? '', env)
+  if (url.pathname.startsWith('/api/llm/')) return forwardLlm(req, url, opts)
   return null
 }
 
-async function fetchPage(target: string): Promise<Response> {
+/** Headers worth passing to an LLM provider; cookies and browser-identifying headers stay behind. */
+const LLM_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'x-api-key', 'openai-organization', 'openai-project', 'http-referer', 'x-title']
+
+async function forwardLlm(req: Request, url: URL, opts: ProxyOptions): Promise<Response> {
+  const base = req.headers.get('x-openbot-target') ?? ''
+  let target: URL
+  try {
+    target = new URL(base.replace(/\/+$/, '') + url.pathname.slice('/api/llm'.length) + url.search)
+  } catch {
+    return json({ error: 'Missing or invalid x-openbot-target header' }, 400)
+  }
+  if (target.protocol !== 'https:') return json({ error: 'Only https providers can be reached through the server' }, 400)
+  if (isPrivateHost(target.hostname) || (opts.isAllowedHost && !(await opts.isAllowedHost(target.hostname)))) {
+    return json({ error: 'Private, local or unresolvable provider addresses are blocked' }, 403)
+  }
+  const headers = new Headers()
+  for (const h of LLM_REQUEST_HEADERS) {
+    const v = req.headers.get(h)
+    if (v) headers.set(h, v)
+  }
+  const res = await fetch(target, {
+    method: req.method,
+    headers,
+    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.arrayBuffer(),
+    redirect: 'manual',
+    signal: req.signal,
+  }).catch((e: unknown) => e as Error)
+  if (res instanceof Error) return json({ error: `Could not reach the provider: ${res.message}` }, 502)
+  // Stream the body straight through (chat completions arrive as server-sent events).
+  const out = new Headers({ 'cache-control': 'no-store' })
+  for (const h of ['content-type', 'x-request-id', 'retry-after']) {
+    const v = res.headers.get(h)
+    if (v) out.set(h, v)
+  }
+  return new Response(res.body, { status: res.status, headers: out })
+}
+
+async function fetchPage(target: string, opts: ProxyOptions): Promise<Response> {
   let parsed: URL
   try {
     parsed = new URL(target)
   } catch {
     return json({ error: 'Invalid URL' }, 400)
   }
-  if (!['http:', 'https:'].includes(parsed.protocol)) return json({ error: 'Only http(s) URLs are allowed' }, 400)
-  if (isPrivateHost(parsed.hostname)) return json({ error: 'Private and local addresses are blocked' }, 403)
 
-  const res = await fetch(parsed, {
-    headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5' },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(15_000),
-  }).catch((e: unknown) => e as Error)
-  if (res instanceof Error) return json({ error: `Fetch failed: ${res.message}` }, 502)
-  // A redirect may have landed somewhere private.
-  if (isPrivateHost(new URL(res.url).hostname)) return json({ error: 'Redirected to a private address' }, 403)
+  // Follow redirects one hop at a time so every hop is checked before it is requested.
+  let res: Response | Error = new Error('no request')
+  for (let hop = 0; hop <= 5; hop++) {
+    if (!['http:', 'https:'].includes(parsed.protocol)) return json({ error: 'Only http(s) URLs are allowed' }, 400)
+    if (isPrivateHost(parsed.hostname) || (opts.isAllowedHost && !(await opts.isAllowedHost(parsed.hostname)))) {
+      return json({ error: hop ? 'Redirected to a private or unresolvable address' : 'Private, local or unresolvable addresses are blocked' }, 403)
+    }
+    res = await fetch(parsed, {
+      headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15_000),
+    }).catch((e: unknown) => e as Error)
+    if (res instanceof Error) return json({ error: `Fetch failed: ${res.message}` }, 502)
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null
+    if (!location) break
+    parsed = new URL(location, parsed)
+  }
+  if (res instanceof Error) return json({ error: res.message }, 502)
 
   const body = await readLimited(res)
   return new Response(body, {
     status: res.status,
     headers: {
       'content-type': res.headers.get('content-type') ?? 'text/plain',
-      'x-final-url': res.url,
+      'x-final-url': parsed.href,
       'cache-control': 'no-store',
     },
   })

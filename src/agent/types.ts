@@ -1,5 +1,5 @@
 /** What a tool may do. Drives the default rule and the warning shown on approval. */
-export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'notify'
+export type ToolRisk = 'read' | 'write' | 'execute' | 'network' | 'notify' | 'computer'
 export type Rule = 'allow' | 'ask' | 'block'
 
 export interface JsonSchema {
@@ -15,11 +15,22 @@ export interface ToolContext {
   signal: AbortSignal
   /** Lets a tool change its bot (memory, schedules) and persist it. */
   updateBot: (fn: (b: Bot) => Bot) => Promise<void>
+  /** Short status updates while the tool runs (downloads, installs). */
+  progress: (msg: string) => void
 }
 
 export interface ToolOutput {
   output: string
   isError?: boolean
+  /** Workspace files this call created or changed. */
+  files?: string[]
+  /** A screenshot or zoom image, sent back to the model. */
+  image?: ToolImage
+}
+
+export interface ToolImage {
+  data: string
+  mediaType: 'image/png' | 'image/jpeg'
 }
 
 export interface ToolDef {
@@ -48,9 +59,13 @@ export interface Bot {
   id: string
   name: string
   color: string
+  /** Face, eyes and top of the bot's avatar; unset means a look derived from its id. */
+  avatar?: import('./avatar').AvatarStyle
   goal: string
   instructions: string
   engine: Engine
+  /** Gives the bot the shared Linux computer (screenshots, mouse and keyboard). */
+  computer?: boolean
   rules: Record<string, Rule>
   memory: { id: string; text: string; at: number }[]
   schedules: Schedule[]
@@ -62,6 +77,8 @@ export interface ToolCall {
   id: string
   name: string
   input: Record<string, unknown>
+  /** Set for members of Claude's computer toolset, whose results must echo it. */
+  toolset?: 'computer'
 }
 
 export interface ToolResult {
@@ -71,6 +88,11 @@ export interface ToolResult {
   isError: boolean
   /** How it was approved, for the activity log. */
   decision?: 'auto' | 'approved' | 'denied' | 'blocked'
+  files?: string[]
+  /** Wall-clock run time in ms. */
+  ms?: number
+  image?: ToolImage
+  toolset?: 'computer'
 }
 
 /** A step a server-side tool took inside the model's turn (Claude web search/fetch). */
@@ -109,13 +131,16 @@ export interface Thread {
   botId: string
   /** Frozen when the thread starts; editing a bot applies from its next thread. */
   system: string
+  /** Whether this thread has the computer, also frozen at the start. */
+  computer?: boolean
   turns: Turn[]
   createdAt: number
   updatedAt: number
 }
 
 export type BotStatus =
-  | { state: 'idle' }
+  /** `done`: a run just finished; shown briefly as a happy avatar. */
+  | { state: 'idle'; done?: boolean }
   | { state: 'working'; step: string }
   | { state: 'waiting'; approval: PendingApproval }
   | { state: 'error'; message: string }
