@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { computer } from '../computer/vm'
 import { useComputerStatus } from '../hooks/useComputerStatus'
+import { server } from '../lib/server'
 
 /** The live screen of the shared Linux computer, with controls to run it and take over. */
 export function ComputerView({ busyBot }: { busyBot: string | null }) {
@@ -106,9 +107,11 @@ export function ComputerView({ busyBot }: { busyBot: string | null }) {
       )}
       {note && <p className="hint">{note}</p>}
       <p className="hint">
-        Tiny Core Linux on an x86 emulator (v86) compiled to WebAssembly, running in this tab. Its network goes through open-bot's relay to public
-        internet addresses only (when Internet access is on in Settings). Bots that have computer use turned on share it. Snapshots are stored in
-        this browser and saved after each bot run.
+        Tiny Core Linux on an x86 emulator (v86) compiled to WebAssembly, running in this tab.{' '}
+        {server()
+          ? "Its network goes through open-bot's relay to public internet addresses only (when Internet access is on in Settings)."
+          : 'It has no internet: that needs an open-bot server (see Settings).'}{' '}
+        Bots that have computer use turned on share it. Snapshots are stored in this browser and saved after each bot run.
       </p>
     </div>
   )

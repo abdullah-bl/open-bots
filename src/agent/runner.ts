@@ -3,6 +3,7 @@ import type { Bot, ServerStep, Thread, ToolCall, ToolContext, ToolDef, ToolResul
 import { CLIENT_WEB_TOOLS, COMPUTER_TOOL, COMPUTER_TOOLS, TOOLS, TOOL_BY_NAME, ruleFor, validateInput } from './tools'
 import { runComputerAction } from '../computer/actions'
 import { Workspace } from './workspace'
+import { server } from '../lib/server'
 
 const MAX_STEPS = 30
 
@@ -228,7 +229,10 @@ async function runTool(call: ToolCall, workspace: Workspace, signal: AbortSignal
 export function describeError(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err)
   if (/Failed to fetch|NetworkError|CORS|Connection error/i.test(msg)) {
-    return `Could not reach the model provider (${msg}). If it blocks requests from browsers, turn on "Send requests through open-bot's server" in Settings.`
+    const fix = server()
+      ? `turn on "Send requests through open-bot's server" in Settings`
+      : 'set up an open-bot server in Settings and send requests through it'
+    return `Could not reach the model provider (${msg}). If it blocks requests from browsers, ${fix}.`
   }
   if (/\b401\b|invalid.*key|authentication/i.test(msg)) return `The API key was rejected: ${msg}`
   return msg

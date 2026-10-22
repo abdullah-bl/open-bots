@@ -97,11 +97,37 @@ SEARXNG_URL=https://searx.example # or a SearXNG instance
 # neither set: falls back to Wikipedia search
 ```
 
+When the app is served from another site (see GitHub Pages below), the server answers cross-origin requests. Limit which sites may use it:
+
+```bash
+ALLOWED_ORIGINS=https://you.github.io  # comma-separated; unset or * allows any site, empty allows only this one
+ALLOWED_HOSTS=bot.example.com          # domain names `npm run preview -- --host` may answer to
+```
+
 ## Deploying
 
-- Serve the built `dist/` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless`. The CPU engine needs these headers to use more than one thread.
-- Deploy `server/worker.ts` on the same origin, under `/api/*`.
-- API keys are stored in the browser and sent straight to each provider. That's fine for personal use; a shared deployment should keep cloud keys in the proxy instead.
+open-bot is a static app plus a small server. Without the server, bots still have their files, the shell, Python, memory, schedules and the computer, all offline. The server adds web search and page reading for models other than Claude, the passthrough for providers that block browsers (NVIDIA), and internet for the computer and shell. The app finds it in this order: the address in **Settings → open-bot server**, then the build's `VITE_SERVER_URL`, then the site's own origin (unless the build sets `VITE_STATIC_HOST=1`).
+
+### GitHub Pages
+
+`.github/workflows/pages.yml` builds and publishes the site on every push to `main`:
+
+1. In the repository's settings, under **Pages → Build and deployment**, set the source to **GitHub Actions**.
+2. Optionally, add a server (see below) and save its address as the repository variable `OPENBOT_SERVER_URL` (**Settings → Secrets and variables → Actions → Variables**).
+3. Push to `main`, or run the workflow by hand. The site appears at `https://<user>.github.io/<repo>/`.
+
+The workflow downloads the Linux image, builds with the repository name as the base path, and marks the build as static. GitHub Pages can't send the cross-origin isolation headers, so `public/coi-sw.js`, a service worker, adds them; the first visit reloads once to start it. Safari can't isolate this way and runs without threads, so the shell doesn't work there.
+
+### A server for a static site
+
+- **Cloudflare Worker** (web tools and the provider passthrough): `npx wrangler deploy server/worker.ts --name open-bot-proxy --compatibility-date 2026-10-01 --var ALLOWED_ORIGINS:https://<user>.github.io`. It has no WISP relay yet, so the computer and shell stay offline.
+- **Node** (everything, including the relay): on a machine of yours, `npm ci && npm run build && npm run preview -- --host`, behind HTTPS (a GitHub Pages site can only reach `https://` and `wss://` servers), with `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` set.
+
+### One origin
+
+Serve `dist/` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless`, and the server under `/api/*` and `/wisp/` on the same origin. `npm run preview` does exactly this.
+
+API keys are stored in the browser and sent straight to each provider (or through your server, for the passthrough). That's fine for personal use; a shared deployment should keep cloud keys in the server instead.
 
 ## Limits
 

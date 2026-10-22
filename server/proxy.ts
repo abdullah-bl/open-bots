@@ -4,6 +4,7 @@
  * endpoints. Plain Request -> Response, so it runs in the Vite dev server, a
  * Cloudflare Worker, Deno, or Bun unchanged.
  *
+ *   GET  /api/health                { ok: true }, so the app can tell the server is up
  *   GET  /api/fetch?url=https://…   raw page body (the browser extracts the text)
  *   GET  /api/search?q=…            { source, results: [{ title, url, snippet }] }
  *   POST /api/llm/<path>            forwards an OpenAI-style API call to the base URL
@@ -12,11 +13,16 @@
  *
  * Search uses Brave (BRAVE_API_KEY) or SearXNG (SEARXNG_URL) when configured,
  * otherwise falls back to Wikipedia search, which needs no key.
+ *
+ * When the app is hosted elsewhere (GitHub Pages), it calls this server
+ * cross-origin; ALLOWED_ORIGINS limits which sites may do that.
  */
 
 export interface ProxyEnv {
   BRAVE_API_KEY?: string
   SEARXNG_URL?: string
+  /** Comma-separated origins allowed to call this server from other sites; "*" or unset allows any, "" none. */
+  ALLOWED_ORIGINS?: string
 }
 
 const MAX_BYTES = 3_000_000
@@ -29,6 +35,39 @@ export interface ProxyOptions {
 
 export async function handleProxy(req: Request, env: ProxyEnv, opts: ProxyOptions = {}): Promise<Response | null> {
   const url = new URL(req.url)
+  if (!url.pathname.startsWith('/api/')) return null
+  const origin = req.headers.get('origin')
+  if (!originAllowed(origin, url.origin, env.ALLOWED_ORIGINS)) return json({ error: 'This site may not use this server' }, 403)
+  const cors = new Headers({ vary: 'origin' })
+  if (origin && new URL(origin).host !== url.host) {
+    cors.set('access-control-allow-origin', origin)
+    cors.set('access-control-expose-headers', 'x-final-url, x-request-id, retry-after')
+  }
+  if (req.method === 'OPTIONS') {
+    cors.set('access-control-allow-methods', 'GET, POST, OPTIONS')
+    cors.set('access-control-allow-headers', req.headers.get('access-control-request-headers') ?? '*')
+    cors.set('access-control-max-age', '86400')
+    return new Response(null, { status: 204, headers: cors })
+  }
+  const res = await route(req, url, env, opts)
+  cors.forEach((v, k) => res?.headers.set(k, v))
+  return res
+}
+
+/** Whether a page on `origin` may call the server at `self` (same site always may). */
+export function originAllowed(origin: string | null | undefined, self: string, allowed: string | undefined): boolean {
+  if (!origin) return true
+  try {
+    if (new URL(origin).host === new URL(self).host) return true
+  } catch {
+    return false
+  }
+  const list = (allowed ?? '*').split(',').map((o) => o.trim().replace(/\/+$/, ''))
+  return list.includes('*') || list.includes(origin)
+}
+
+async function route(req: Request, url: URL, env: ProxyEnv, opts: ProxyOptions): Promise<Response | null> {
+  if (url.pathname === '/api/health') return json({ ok: true })
   if (url.pathname === '/api/fetch') return fetchPage(url.searchParams.get('url') ?? '', opts)
   if (url.pathname === '/api/search') return search(url.searchParams.get('q') ?? '', env)
   if (url.pathname.startsWith('/api/llm/')) return forwardLlm(req, url, opts)

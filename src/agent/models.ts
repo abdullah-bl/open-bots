@@ -4,6 +4,7 @@ import type { ServerStep, ToolCall, ToolDef, Turn } from './types'
 import { ThinkTagSplitter, localEngine } from '../lib/providers/local'
 import { cloudConfigured, type Settings } from '../lib/settings'
 import { OPENAI_COMPAT_PRESETS, usesServer } from '../lib/providers/openaiCompat'
+import { apiUrl } from '../lib/server'
 
 export interface StepRequest {
   system: string
@@ -56,9 +57,10 @@ export function pickModel(engine: 'auto' | 'cloud' | 'local', s: Settings): Agen
   const preset = OPENAI_COMPAT_PRESETS.find((p) => p.id === s.compatPreset)
   // Providers without CORS (NVIDIA, many self-hosted gateways) are reached through
   // our server's /api/llm passthrough; the real base URL rides along in a header.
-  const viaServer = usesServer(s.compatPreset, s.compatBaseURL, s.compatViaServer)
+  const passthrough = usesServer(s.compatPreset, s.compatBaseURL, s.compatViaServer) ? apiUrl('/api/llm') : null
+  const viaServer = !!passthrough
   const client = new OpenAI({
-    baseURL: viaServer ? `${location.origin}/api/llm` : s.compatBaseURL,
+    baseURL: passthrough ?? s.compatBaseURL,
     apiKey: s.compatKey || 'not-needed',
     dangerouslyAllowBrowser: true,
     ...(viaServer ? { defaultHeaders: { 'x-openbot-target': s.compatBaseURL } } : {}),

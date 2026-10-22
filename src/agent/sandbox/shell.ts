@@ -4,7 +4,6 @@
 // /workspace before a command and changes are copied back after.
 import type { Sandbox, Wasmer as WasmerClient } from '@wasmer/sdk/browser'
 import type { Workspace } from '../workspace'
-import { wispUrl } from '../../lib/settings'
 
 /** bash first: it is the sandbox's shell. */
 const BASE_PACKAGES = ['wasmer/bash', 'wasmer/coreutils', 'wasmer/grep', 'wasmer/sed']
@@ -12,12 +11,13 @@ const OUTPUT_LIMIT = 30_000
 const MAX_SYNC_BYTES = 50_000_000
 
 let client: Promise<WasmerClient> | null = null
-let internet = true
+/** The WISP relay sandboxes reach the internet through; null means no network. */
+let relay: string | null = null
 
-/** Internet for new sandboxes; existing ones are closed so the next command picks it up. */
-export function setShellInternet(on: boolean) {
-  if (on === internet) return
-  internet = on
+/** Network for new sandboxes; existing ones are closed so the next command picks it up. */
+export function setShellRelay(url: string | null) {
+  if (url === relay) return
+  relay = url
   for (const botId of [...shells.keys()]) void closeShell(botId)
 }
 
@@ -53,7 +53,7 @@ function shellFor(botId: string, onProgress?: (msg: string) => void): BotShell {
           shell: pkgs[0].command('bash'),
           env: { HOME: '/workspace', TERM: 'dumb', LANG: 'C.UTF-8' },
           // TCP goes through our WISP relay (public addresses only); names resolve over DNS-over-HTTPS.
-          network: internet ? { mode: 'wisp', url: wispUrl() } : { mode: 'disabled' },
+          network: relay ? { mode: 'wisp', url: relay } : { mode: 'disabled' },
         })
       }),
       installed: new Set(BASE_PACKAGES),

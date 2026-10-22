@@ -4,7 +4,6 @@
 // keyboard actions are fed in as emulated PS/2 and VMware-mouse input.
 import type { V86 } from 'v86'
 import { comboScancodes, modifierScancodes, textScancodes } from './keys'
-import { wispUrl } from '../lib/settings'
 import { tcpTick } from './tcpfix'
 
 export type VMState = 'off' | 'loading' | 'booting' | 'ready' | 'error'
@@ -26,7 +25,7 @@ export interface Screenshot {
   height: number
 }
 
-const ASSETS = '/vm/'
+const ASSETS = `${import.meta.env.BASE_URL}vm/`
 // Bump the version whenever the machine's hardware changes: a snapshot only
 // restores onto the hardware it was saved from. v2 added a network card and 256 MB;
 // v3 switched that card from NE2000 to virtio-net.
@@ -58,11 +57,12 @@ class ComputerVM {
   private booted: Promise<void> | null = null
   /** Serializes actions so two bots (or a bot and a snapshot) never interleave input. */
   private queue: Promise<unknown> = Promise.resolve()
-  private internet = true
+  /** The WISP relay for the network card; null leaves the card with no outside network. */
+  private relay: string | null = null
 
   /** Takes effect on the next start (the relay is chosen when the machine boots). */
-  setInternet(on: boolean) {
-    this.internet = on
+  setRelay(url: string | null) {
+    this.relay = url
   }
 
   constructor() {
@@ -126,8 +126,9 @@ class ComputerVM {
       cdrom: { url: `${ASSETS}tinycore.iso` },
       // A virtio-net card (much faster than the emulated NE2000) that the guest's
       // DHCP picks up; v86 turns its traffic into WISP streams to our relay and
-      // resolves DNS over HTTPS.
-      net_device: { type: 'virtio', relay_url: wispUrl(!this.internet).replace(/^ws/, 'wisp') },
+      // resolves DNS over HTTPS. Without a relay the card stays (snapshots
+      // expect it) but only talks to v86's in-browser network.
+      net_device: { type: 'virtio', relay_url: this.relay ? this.relay.replace(/^ws/, 'wisp') : 'inbrowser' },
       screen: { container: this.screen, use_graphical_text: true },
       ...(snapshot ? { initial_state: { buffer: snapshot } } : {}),
       autostart: true,

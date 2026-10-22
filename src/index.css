@@ -190,6 +190,25 @@ button:disabled {
 .hint.warn {
   color: var(--danger);
 }
+.server-reach::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  vertical-align: 1px;
+  background: var(--muted);
+}
+.server-reach.ok::before {
+  background: var(--ok);
+}
+.server-reach.down {
+  color: var(--danger);
+}
+.server-reach.down::before {
+  background: var(--danger);
+}
 .empty-note {
   margin: 0;
   color: var(--muted);

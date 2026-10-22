@@ -4,6 +4,7 @@ import { runPython } from './sandbox/sandbox'
 import { runShell } from './sandbox/shell'
 import { computeNextRun } from './scheduler'
 import { runComputerAction } from '../computer/actions'
+import { NO_SERVER, apiUrl } from '../lib/server'
 
 const MAX_READ = 40_000
 
@@ -129,7 +130,9 @@ export const TOOLS: ToolDef[] = [
     description: 'Search the web. Returns titles, URLs and snippets; follow up with fetch_url to read a page.',
     schema: schema({ query: str('Search query') }),
     async run(input) {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(String(input.query))}`)
+      const url = apiUrl(`/api/search?q=${encodeURIComponent(String(input.query))}`)
+      if (!url) return { output: NO_SERVER, isError: true }
+      const res = await fetch(url)
       const data = (await res.json()) as { error?: string; note?: string; source?: string; results?: { title: string; url: string; snippet: string }[] }
       if (data.error) return { output: data.error, isError: true }
       const lines = (data.results ?? []).map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
@@ -143,7 +146,9 @@ export const TOOLS: ToolDef[] = [
     description: 'Fetch a web page or file by URL and return its readable text (and links). Public http(s) URLs only.',
     schema: schema({ url: str('Absolute http(s) URL') }),
     async run(input) {
-      const res = await fetch(`/api/fetch?url=${encodeURIComponent(String(input.url))}`)
+      const url = apiUrl(`/api/fetch?url=${encodeURIComponent(String(input.url))}`)
+      if (!url) return { output: NO_SERVER, isError: true }
+      const res = await fetch(url)
       const type = res.headers.get('content-type') ?? ''
       if (type.includes('application/json') && !res.ok) {
         const data = (await res.json()) as { error?: string }

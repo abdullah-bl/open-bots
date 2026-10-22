@@ -8,6 +8,7 @@ import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { isBlockedPort, resolvePublic } from './netpolicy.ts'
+import { originAllowed } from './proxy.ts'
 
 const CONNECT = 0x01
 const DATA = 0x02
@@ -41,6 +42,8 @@ const MAX_DATA_FRAME = 64 * 1024
 export interface WispOptions {
   /** Called with a short line per connection decision. */
   log?: (line: string) => void
+  /** Origins allowed to open the relay from other sites, as for the proxy's ALLOWED_ORIGINS. */
+  allowedOrigins?: string
 }
 
 interface ConnectionOptions extends WispOptions {
@@ -215,6 +218,11 @@ export function wispUpgradeHandler(path: string, opts: WispOptions = {}) {
     if (!url.pathname.startsWith(path)) return false
     // "?offline" keeps the client's network card working but refuses every connection.
     const offline = url.searchParams.has('offline')
+    if (!originAllowed(req.headers.origin, `http://${req.headers.host}`, opts.allowedOrigins)) {
+      opts.log?.(`refused origin ${req.headers.origin}`)
+      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n')
+      return true
+    }
     wss.handleUpgrade(req, socket, head, (ws) => serve(ws, { ...opts, offline }))
     return true
   }

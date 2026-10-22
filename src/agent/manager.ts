@@ -6,7 +6,8 @@ import { buildSystemPrompt } from './prompt'
 import { computeNextRun } from './scheduler'
 import { deleteBotData, loadBots, loadThreads, saveBot, saveThread } from './store'
 import { Workspace } from './workspace'
-import { closeShell, setShellInternet } from './sandbox/shell'
+import { closeShell, setShellRelay } from './sandbox/shell'
+import { resolveServer, setServer, wispUrl } from '../lib/server'
 import { computer } from '../computer/vm'
 import { botFromTemplate, type BotTemplate } from './templates'
 
@@ -52,8 +53,10 @@ class AgentManager {
 
   setSettings(s: Settings) {
     this.settings = s
-    setShellInternet(s.internet)
-    computer().setInternet(s.internet)
+    setServer(resolveServer(s.serverURL))
+    setShellRelay(s.internet ? wispUrl() : null)
+    // The computer keeps its network card either way; offline it gets a relay that refuses everything.
+    computer().setRelay(wispUrl(!s.internet))
   }
 
   async init() {

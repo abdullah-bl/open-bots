@@ -8,6 +8,8 @@ export interface Settings {
   privacy: boolean
   /** Internet for the Linux computer and the shell, through the WISP relay. */
   internet: boolean
+  /** open-bot's server (web tools, LLM passthrough, relay); empty means the build's default. */
+  serverURL: string
   localModel: string
   autoLoadLocal: boolean
   cloud: CloudKind
@@ -24,6 +26,7 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   privacy: false,
   internet: true,
+  serverURL: '',
   // Each backend falls back to its own default when this id belongs to the other one.
   localModel: 'Qwen3.5-2B-q4f16_1-MLC',
   autoLoadLocal: false,
@@ -63,10 +66,4 @@ export function useSettings() {
 export function cloudConfigured(s: Settings) {
   if (s.cloud === 'anthropic') return !!s.anthropicKey
   return !!s.compatBaseURL && !!s.compatModel
-}
-
-/** The WISP relay on this site, as ws(s)://host/wisp/; `offline` refuses every connection. */
-export function wispUrl(offline = false) {
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${scheme}://${location.host}/wisp/${offline ? '?offline' : ''}`
 }
